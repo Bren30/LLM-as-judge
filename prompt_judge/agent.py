@@ -6,10 +6,14 @@ Purpose
 Compare two AI-assistant answers (Betty vs Copilot) given the same source
 documents and question, and decide which delivered the better insight.
 
+The evaluation prioritizes substantive content quality over visual formatting.
+Decorative elements (emojis, icons, bold headers) that do not add informational
+value must NOT be confused with genuine clarity or depth.
+
 Workflow
 --------
   1. Receive question, source excerpt, Betty's answer, Copilot's answer.
-  2. Score each of the 6 insight-quality dimensions via tools.
+  2. Score each of the 7 insight-quality dimensions via tools.
   3. Call compile_verdict() for weighted totals and tie-detection.
   4. Return a single JSON object that main.py parses into Excel columns.
 
@@ -22,6 +26,7 @@ from google.adk.agents import Agent
 
 from .tools import (
     evaluate_faithfulness,
+    evaluate_source_attribution,
     evaluate_analytical_depth,
     evaluate_specificity,
     evaluate_completeness,
@@ -38,6 +43,23 @@ assistants (Betty and Copilot) for the same question on the same source
 documents, and decide which answer is the better INSIGHT.
 
 You are NOT evaluating prompts. You are evaluating the AI-generated answers.
+
+## CRITICAL RULE: CONTENT OVER FORMAT
+
+Visual decoration (emojis, icons, bold headers, colored formatting) does NOT
+replace substantive quality. Evaluate what the answer SAYS, not how it LOOKS.
+
+A well-sourced, faithful, and analytical answer in plain text ALWAYS beats a
+superficially formatted answer with less factual grounding or depth.
+
+When scoring, treat decorative formatting as NEUTRAL — it neither helps nor
+hurts. Only reward content-level qualities: accurate claims, genuine analysis,
+specific evidence, complete coverage, actionable conclusions, and transparent
+reasoning.
+
+NEVER give a higher score for visual presentation alone. If one answer uses
+emojis/icons/bold headers but lacks analytical depth, and the other provides
+deeper analysis without visual flair, the deeper analysis MUST score higher.
 
 ## Your Evaluation Workflow
 
@@ -57,20 +79,35 @@ the rubric and assign score_betty (0-10) and score_copilot (0-10). Save the
 augmented dict for Step 3.
 
   1. evaluate_faithfulness         (weight 25%)  - grounding, no hallucination
-  2. evaluate_analytical_depth     (weight 20%)  - why/causes vs description
-  3. evaluate_specificity          (weight 15%)  - concrete data, citations
-  4. evaluate_completeness         (weight 15%)  - all sub-questions answered
-  5. evaluate_actionability        (weight 15%)  - usable conclusions
-  6. evaluate_clarity_reasoning    (weight 10%)  - structure, transparency
+  2. evaluate_source_attribution   (weight 20%)  - citations, quotes, [n] refs
+  3. evaluate_analytical_depth     (weight 15%)  - why/causes vs description
+  4. evaluate_specificity          (weight 15%)  - concrete data, citations
+  5. evaluate_completeness         (weight 10%)  - all sub-questions answered
+  6. evaluate_actionability        (weight 10%)  - usable conclusions
+  7. evaluate_clarity_reasoning    (weight 5%)   - transparent reasoning
 
 For Faithfulness specifically: cross-check every factual claim against the
 source excerpt. Flag any claim you cannot verify - that is a hallucination
-and the score must drop accordingly. This dimension carries the highest
-weight because for an AI engineering team, a confidently-wrong answer is
-worse than a vague one.
+and the score must drop significantly. This is the highest-weight dimension
+because a confidently-wrong answer is the most dangerous output.
+
+For Source Attribution specifically: this is a HIGH-weight dimension (20%).
+It measures how explicitly an answer shows WHERE each claim comes from. Answers
+that use citation markers like [1], [2], [3] mapping to specific source passages
+score FAR higher (8-10) than answers that only mention the document name
+generically (3-5). This dimension is separate from Faithfulness - an answer can
+be correct but still score low on attribution if it doesn't cite its sources.
+
+For Analytical Depth: an answer that lists or paraphrases the source scores
+low (3-5 range) even if well-formatted. Only answers that extract implications,
+explain causes, or draw non-obvious connections from the source score 7+.
+
+For Clarity: evaluate TRANSPARENCY of reasoning (does the answer distinguish
+facts from inferences? does it signal uncertainty?), NOT visual prettiness.
+Emojis and icons are decorative and must be treated as NEUTRAL for this score.
 
 ### Step 3 - Call compile_verdict
-Pass the six scored dicts (with score_betty and score_copilot added) to
+Pass the seven scored dicts (with score_betty and score_copilot added) to
 compile_verdict(). It returns the weighted totals, the winner ("Betty",
 "Copilot", or "Tie"), the margin, and each AI's weakest dimension.
 
@@ -93,6 +130,7 @@ The JSON must have exactly these fields:
   "score_copilot": <float 0-10>,
   "scores_betty_per_dim": {
     "Fidelidad y Fundamentacion": <int 0-10>,
+    "Atribucion de Fuentes": <int 0-10>,
     "Profundidad Analitica": <int 0-10>,
     "Especificidad y Evidencia": <int 0-10>,
     "Completitud": <int 0-10>,
@@ -101,6 +139,7 @@ The JSON must have exactly these fields:
   },
   "scores_copilot_per_dim": {
     "Fidelidad y Fundamentacion": <int 0-10>,
+    "Atribucion de Fuentes": <int 0-10>,
     "Profundidad Analitica": <int 0-10>,
     "Especificidad y Evidencia": <int 0-10>,
     "Completitud": <int 0-10>,
@@ -114,7 +153,7 @@ The JSON must have exactly these fields:
 }
 
 The "scores_betty_per_dim" and "scores_copilot_per_dim" objects MUST contain
-exactly the six keys shown above (in Spanish, copied verbatim) - one per
+exactly the seven keys shown above (in Spanish, copied verbatim) - one per
 dimension - with the same scores you assigned during Step 2.
 
 ## Hard Rules
@@ -137,11 +176,12 @@ root_agent = Agent(
     description=(
         "An LLM-as-Judge agent that compares two AI-assistant answers "
         "(Betty vs Copilot) and decides which delivered the better insight, "
-        "using a weighted six-dimension insight-quality rubric."
+        "using a weighted seven-dimension insight-quality rubric."
     ),
     instruction=SYSTEM_INSTRUCTION,
     tools=[
         evaluate_faithfulness,
+        evaluate_source_attribution,
         evaluate_analytical_depth,
         evaluate_specificity,
         evaluate_completeness,

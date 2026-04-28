@@ -2,11 +2,12 @@
 main.py - Entry point for the Insight Quality Judge POC.
 
 Workflow per run:
-    1. Read all PDF/DOCX files in ./documents/ (abort if empty).
-    2. Ask the user for: the question, Betty's answer, Copilot's answer.
-    3. Send everything to the judge agent.
-    4. Parse the agent's JSON verdict.
-    5. Append one row to ./evaluations.xlsx (12 columns).
+    1. Read input rows from the "Input" sheet in evaluations.xlsx.
+    2. For each row:
+       a. Load only the documents listed in doc_a_usar.
+       b. Send the question, source text, and both answers to the judge agent.
+       c. Parse the agent's JSON verdict.
+       d. Append one row to the "Evaluations" sheet (with token counts).
 
 Run from the project root:
     python main.py
@@ -22,7 +23,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# Force UTF-8 output on Windows.
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
@@ -41,8 +41,8 @@ if _PROJECT != "acpe-dev-uc-ai":
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
 from rich.rule import Rule
+from rich.table import Table
 
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -55,6 +55,9 @@ console = Console()
 PROJECT_ROOT = Path(__file__).parent
 DOCUMENTS_DIR = PROJECT_ROOT / "documents"
 EXCEL_PATH = PROJECT_ROOT / "evaluations.xlsx"
+
+EVAL_SHEET = "Evaluations"
+INPUT_SHEET = "Input"
 
 EXCEL_COLUMNS = [
     "fecha",
@@ -73,11 +76,20 @@ EXCEL_COLUMNS = [
     "mejora_principal",
     "respuesta_betty",
     "respuesta_copilot",
+    "token_input",
+    "token_output",
 ]
 
-# Short labels used inside the per-dimension cells.
+INPUT_COLUMNS = [
+    "pregunta",
+    "respuesta_betty",
+    "respuesta_copilot",
+    "doc_a_usar",
+]
+
 DIMENSION_SHORT_LABELS = {
     "Fidelidad y Fundamentacion": "Fidelidad",
+    "Atribucion de Fuentes": "Atribucion",
     "Profundidad Analitica": "Profundidad",
     "Especificidad y Evidencia": "Especificidad",
     "Completitud": "Completitud",
@@ -94,6 +106,7 @@ def format_per_dim(scores: dict | None) -> str:
         if full_name in scores:
             parts.append(f"{short_name}: {scores[full_name]}")
     return " | ".join(parts)
+
 
 _SESSION_COUNTER = 0
 
@@ -118,14 +131,16 @@ def _read_docx(path: Path) -> str:
     return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
 
 
-def load_source_documents() -> tuple[str, list[str]]:
+def load_source_documents(filenames: list[str] | None = None) -> tuple[str, list[str]]:
     """
-    Load every supported file in ./documents/ and concatenate the text.
+    Load supported files in ./documents/ and concatenate the text.
+
+    Args:
+        filenames: If provided, only load files whose names are in this list.
+                    If None, load all supported files.
 
     Returns:
         (combined_text, list_of_filenames)
-
-    Aborts the program with a clear error if the folder is missing or empty.
     """
     if not DOCUMENTS_DIR.exists():
         sys.exit(
@@ -133,20 +148,34 @@ def load_source_documents() -> tuple[str, list[str]]:
             "Create the folder and place your PDF/DOCX files inside before running."
         )
 
-    files = sorted(
+    all_files = sorted(
         p for p in DOCUMENTS_DIR.iterdir()
         if p.is_file() and p.suffix.lower() in (".pdf", ".docx")
     )
-    if not files:
+
+    if filenames:
+        name_map = {f.name: f for f in all_files}
+        selected = []
+        for name in filenames:
+            name_stripped = name.strip()
+            if name_stripped not in name_map:
+                sys.exit(
+                    f"[ERROR] Document '{name_stripped}' not found in {DOCUMENTS_DIR}.\n"
+                    f"Available: {', '.join(name_map.keys())}"
+                )
+            selected.append(name_map[name_stripped])
+    else:
+        selected = all_files
+
+    if not selected:
         sys.exit(
-            f"[ERROR] No PDF or DOCX files found in {DOCUMENTS_DIR}\n"
-            "Place the same files you sent to Betty and Copilot inside this folder, then re-run.\n"
-            "Supported formats: .pdf, .docx"
+            f"[ERROR] No PDF or DOCX files found matching the selection.\n"
+            f"Available: {', '.join(f.name for f in all_files)}"
         )
 
     sections: list[str] = []
-    filenames: list[str] = []
-    for path in files:
+    used_names: list[str] = []
+    for path in selected:
         try:
             if path.suffix.lower() == ".pdf":
                 text = _read_pdf(path)
@@ -155,30 +184,9 @@ def load_source_documents() -> tuple[str, list[str]]:
         except Exception as e:
             sys.exit(f"[ERROR] Could not read {path.name}: {e}")
         sections.append(f"===== FILE: {path.name} =====\n{text}")
-        filenames.append(path.name)
+        used_names.append(path.name)
 
-    return "\n\n".join(sections), filenames
-
-
-# ---------------------------------------------------------------------------
-# Multiline input (END sentinel - real chatbot answers contain blank lines)
-# ---------------------------------------------------------------------------
-
-def collect_multiline(label: str) -> str:
-    console.print(f"\n[bold]{label}[/bold] [dim](paste your text, then type END on its own line)[/dim]:")
-    lines: list[str] = []
-    while True:
-        try:
-            line = input()
-        except EOFError:
-            break
-        if line.strip().upper() == "END":
-            break
-        lines.append(line)
-    text = "\n".join(lines).strip()
-    if not text:
-        sys.exit("[ERROR] Empty input. Aborting.")
-    return text
+    return "\n\n".join(sections), used_names
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +215,7 @@ async def run_judge(
     source_excerpt: str,
     answer_betty: str,
     answer_copilot: str,
-) -> str:
+) -> tuple[str, int | None, int | None]:
     global _SESSION_COUNTER
     _SESSION_COUNTER += 1
     session_id = f"eval_session_{_SESSION_COUNTER:03d}"
@@ -233,31 +241,38 @@ async def run_judge(
     )
 
     final_response = ""
+    token_input: int | None = None
+    token_output: int | None = None
+
     async for event in runner.run_async(
         user_id="poc_user",
         session_id=session_id,
         new_message=user_message,
     ):
         if event.is_final_response():
-            print(event.content.parts[0])
             final_response = event.content.parts[0].text
 
-    return final_response
+        if event.usage_metadata is not None:
+            um = event.usage_metadata
+            if um.prompt_token_count is not None:
+                token_input = (token_input or 0) + um.prompt_token_count
+            if um.candidates_token_count is not None:
+                token_output = (token_output or 0) + um.candidates_token_count
+
+    return final_response, token_input, token_output
 
 
 # ---------------------------------------------------------------------------
-# JSON parsing (the agent returns JSON; tolerate stray code fences)
+# JSON parsing
 # ---------------------------------------------------------------------------
 
 def parse_verdict(raw: str) -> dict:
     text = raw.strip()
     if text.startswith("```"):
-        # strip ```json ... ``` or ``` ... ``` fences
         text = text.strip("`")
         if text.lower().startswith("json"):
             text = text[4:]
         text = text.strip("`").strip()
-    # find the first { and last }
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1:
@@ -269,19 +284,94 @@ def parse_verdict(raw: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Excel logging (append a row to evaluations.xlsx)
+# Excel helpers
 # ---------------------------------------------------------------------------
 
-def append_to_excel(row: dict) -> None:
+def _get_or_create_workbook():
+    from openpyxl import Workbook, load_workbook
+
+    if EXCEL_PATH.exists():
+        return load_workbook(EXCEL_PATH)
+    wb = Workbook()
+    wb.active.title = EVAL_SHEET
+    ws = wb[EVAL_SHEET]
+    ws.append(EXCEL_COLUMNS)
+    ws = wb.create_sheet(INPUT_SHEET)
+    ws.append(INPUT_COLUMNS)
+    wb.save(EXCEL_PATH)
+    return wb
+
+
+def ensure_input_sheet():
+    """Ensure the Input sheet exists with headers. Returns the workbook."""
     from openpyxl import Workbook, load_workbook
 
     if EXCEL_PATH.exists():
         wb = load_workbook(EXCEL_PATH)
-        ws = wb.active
+        if INPUT_SHEET not in wb.sheetnames:
+            ws = wb.create_sheet(INPUT_SHEET)
+            ws.append(INPUT_COLUMNS)
+            wb.save(EXCEL_PATH)
+        if EVAL_SHEET not in wb.sheetnames:
+            ws = wb.create_sheet(EVAL_SHEET)
+            ws.append(EXCEL_COLUMNS)
+            wb.save(EXCEL_PATH)
+        return wb
     else:
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Evaluations"
+        wb.active.title = EVAL_SHEET
+        wb[EVAL_SHEET].append(EXCEL_COLUMNS)
+        ws = wb.create_sheet(INPUT_SHEET)
+        ws.append(INPUT_COLUMNS)
+        wb.save(EXCEL_PATH)
+        return wb
+
+
+def read_input_rows() -> list[dict]:
+    """Read all data rows from the Input sheet."""
+    from openpyxl import load_workbook
+
+    if not EXCEL_PATH.exists():
+        sys.exit(
+            f"[ERROR] Excel file not found: {EXCEL_PATH}\n"
+            f"Create it with an '{INPUT_SHEET}' sheet containing columns: "
+            f"{', '.join(INPUT_COLUMNS)}"
+        )
+
+    wb = load_workbook(EXCEL_PATH, data_only=True)
+    if INPUT_SHEET not in wb.sheetnames:
+        sys.exit(
+            f"[ERROR] Sheet '{INPUT_SHEET}' not found in {EXCEL_PATH}.\n"
+            f"Available sheets: {', '.join(wb.sheetnames)}"
+        )
+
+    ws = wb[INPUT_SHEET]
+    rows = []
+    for row_idx in range(2, ws.max_row + 1):
+        vals = [ws.cell(row=row_idx, column=c).value for c in range(1, len(INPUT_COLUMNS) + 1)]
+        pregunta = vals[0]
+        if pregunta is None or str(pregunta).strip() == "":
+            continue
+        row_data = {}
+        for i, col_name in enumerate(INPUT_COLUMNS):
+            row_data[col_name] = vals[i] if i < len(vals) else ""
+        rows.append(row_data)
+
+    return rows
+
+
+def append_to_excel(row: dict) -> None:
+    from openpyxl import load_workbook
+
+    if EXCEL_PATH.exists():
+        wb = load_workbook(EXCEL_PATH)
+    else:
+        wb = _get_or_create_workbook()
+
+    if EVAL_SHEET in wb.sheetnames:
+        ws = wb[EVAL_SHEET]
+    else:
+        ws = wb.create_sheet(EVAL_SHEET)
         ws.append(EXCEL_COLUMNS)
 
     ws.append([row.get(col, "") for col in EXCEL_COLUMNS])
@@ -295,7 +385,7 @@ def append_to_excel(row: dict) -> None:
 def print_banner() -> None:
     console.print(
         Panel.fit(
-            "[bold cyan]*** Insight Quality Judge ***[/bold cyan]\n"
+            "[bold cyan]*** Insight Quality Judge - Batch Mode ***[/bold cyan]\n"
             "[dim]Betty vs Copilot - LLM-as-Judge for AI Engineering[/dim]\n"
             f"[dim]Project: {_PROJECT}[/dim]",
             border_style="cyan",
@@ -306,58 +396,91 @@ def print_banner() -> None:
 async def _async_main() -> None:
     print_banner()
 
-    # 1. Load source documents (abort if empty)
-    console.print(Rule("[bold]Step 1 - Loading source documents[/bold]"))
-    source_text, filenames = load_source_documents()
-    console.print(f"[green]Loaded {len(filenames)} file(s):[/green] {', '.join(filenames)}")
+    ensure_input_sheet()
+    input_rows = read_input_rows()
 
-    # 2. Collect inputs
-    console.print(Rule("[bold]Step 2 - Inputs[/bold]"))
-    question = Prompt.ask("\n[bold]Question that was asked to both AIs[/bold]").strip()
-    if not question:
-        sys.exit("[ERROR] Empty question. Aborting.")
-    answer_betty = collect_multiline("Paste Betty's answer")
-    answer_copilot = collect_multiline("Paste Copilot's answer")
+    if not input_rows:
+        console.print("[bold red]No input rows found in the 'Input' sheet.[/bold red]")
+        console.print(f"[dim]Add rows with columns: {', '.join(INPUT_COLUMNS)}[/dim]")
+        return
 
-    # 3. Run the judge
-    console.print(Rule("[bold]Step 3 - Running the judge[/bold]"))
-    console.print("[yellow]Evaluating... please wait ~30 s[/yellow]")
-    raw = await run_judge(question, source_text, answer_betty, answer_copilot)
-    verdict = parse_verdict(raw)
+    console.print(Rule(f"[bold]Found {len(input_rows)} input row(s) to process[/bold]"))
 
-    # 4. Append to Excel
-    now = datetime.now()
-    row = {
-        "fecha": now.strftime("%Y-%m-%d"),
-        "hora": now.strftime("%H:%M:%S"),
-        "pregunta": question,
-        "archivos_usados": ", ".join(filenames),
-        "ganador": verdict.get("winner", ""),
-        "margen": verdict.get("margin", ""),
-        "puntaje_betty": verdict.get("score_betty", ""),
-        "puntaje_copilot": verdict.get("score_copilot", ""),
-        "puntajes_por_dimension_betty": format_per_dim(verdict.get("scores_betty_per_dim")),
-        "puntajes_por_dimension_copilot": format_per_dim(verdict.get("scores_copilot_per_dim")),
-        "dimension_mas_debil_betty": verdict.get("betty_weakest_dim", ""),
-        "dimension_mas_debil_copilot": verdict.get("copilot_weakest_dim", ""),
-        "razonamiento": verdict.get("reasoning", ""),
-        "mejora_principal": verdict.get("top_improvement", ""),
-        "respuesta_betty": answer_betty,
-        "respuesta_copilot": answer_copilot,
-    }
-    append_to_excel(row)
+    input_table = Table(title="Input Rows", show_lines=True)
+    input_table.add_column("#", style="cyan", justify="right")
+    input_table.add_column("Pregunta", style="white", max_width=40)
+    input_table.add_column("Doc(s)", style="green", max_width=30)
+    for i, row in enumerate(input_rows, 1):
+        pregunta = str(row.get("pregunta", ""))[:40]
+        docs = str(row.get("doc_a_usar", ""))[:30]
+        input_table.add_row(str(i), pregunta, docs)
+    console.print(input_table)
 
-    # 5. Brief console confirmation (no full report - all detail is in Excel)
-    console.print(Rule("[bold green]Done[/bold green]"))
-    winner = verdict.get("winner", "?")
-    if winner == "Empate":
-        console.print(f"[bold]Resultado:[/bold] Empate - estan aproximadamente equivalentes "
-                      f"(Betty {verdict.get('score_betty')} / Copilot {verdict.get('score_copilot')})")
-    else:
-        console.print(f"[bold]Ganador:[/bold] {winner} "
-                      f"(Betty {verdict.get('score_betty')} / Copilot {verdict.get('score_copilot')}, "
-                      f"margen {verdict.get('margin')})")
-    console.print(f"[dim]Fila agregada a {EXCEL_PATH}[/dim]")
+    for idx, row_data in enumerate(input_rows, 1):
+        pregunta = str(row_data.get("pregunta", "")).strip()
+        answer_betty = str(row_data.get("respuesta_betty", "")).strip()
+        answer_copilot = str(row_data.get("respuesta_copilot", "")).strip()
+        doc_a_usar_raw = str(row_data.get("doc_a_usar", "")).strip()
+
+        if not pregunta:
+            console.print(f"[yellow]Row {idx}: Empty pregunta, skipping.[/yellow]")
+            continue
+
+        doc_filenames = [d.strip() for d in doc_a_usar_raw.split(",") if d.strip()] if doc_a_usar_raw else []
+
+        console.print(Rule(f"[bold]Row {idx}/{len(input_rows)}[/bold]"))
+        console.print(f"[bold]Question:[/bold] {pregunta}")
+        console.print(f"[bold]Documents:[/bold] {', '.join(doc_filenames) if doc_filenames else 'all'}")
+
+        source_text, filenames = load_source_documents(
+            filenames=doc_filenames if doc_filenames else None
+        )
+        console.print(f"[green]Loaded {len(filenames)} file(s):[/green] {', '.join(filenames)}")
+
+        console.print("[yellow]Evaluating... please wait ~30 s[/yellow]")
+        raw, token_input, token_output = await run_judge(pregunta, source_text, answer_betty, answer_copilot)
+        verdict = parse_verdict(raw)
+
+        now = datetime.now()
+        result_row = {
+            "fecha": now.strftime("%Y-%m-%d"),
+            "hora": now.strftime("%H:%M:%S"),
+            "pregunta": pregunta,
+            "archivos_usados": ", ".join(filenames),
+            "ganador": verdict.get("winner", ""),
+            "margen": verdict.get("margin", ""),
+            "puntaje_betty": verdict.get("score_betty", ""),
+            "puntaje_copilot": verdict.get("score_copilot", ""),
+            "puntajes_por_dimension_betty": format_per_dim(verdict.get("scores_betty_per_dim")),
+            "puntajes_por_dimension_copilot": format_per_dim(verdict.get("scores_copilot_per_dim")),
+            "dimension_mas_debil_betty": verdict.get("betty_weakest_dim", ""),
+            "dimension_mas_debil_copilot": verdict.get("copilot_weakest_dim", ""),
+            "razonamiento": verdict.get("reasoning", ""),
+            "mejora_principal": verdict.get("top_improvement", ""),
+            "respuesta_betty": answer_betty,
+            "respuesta_copilot": answer_copilot,
+            "token_input": token_input if token_input is not None else "",
+            "token_output": token_output if token_output is not None else "",
+        }
+        append_to_excel(result_row)
+
+        winner = verdict.get("winner", "?")
+        if winner == "Empate":
+            console.print(
+                f"[bold]Resultado:[/bold] Empate - "
+                f"(Betty {verdict.get('score_betty')} / Copilot {verdict.get('score_copilot')})"
+            )
+        else:
+            console.print(
+                f"[bold]Ganador:[/bold] {winner} "
+                f"(Betty {verdict.get('score_betty')} / Copilot {verdict.get('score_copilot')}, "
+                f"margen {verdict.get('margin')})"
+            )
+        console.print(f"[dim]Tokens: input={token_input}, output={token_output}[/dim]")
+        console.print(f"[dim]Row {idx} saved to {EXCEL_PATH}[/dim]")
+
+    console.print(Rule("[bold green]All rows processed![/bold green]"))
+    console.print(f"[bold green]{len(input_rows)} evaluation(s) saved to {EXCEL_PATH}[/bold green]")
 
 
 if __name__ == "__main__":
